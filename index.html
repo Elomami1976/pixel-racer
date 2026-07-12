@@ -1,0 +1,575 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Pixel Racer</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: #111;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    overflow: hidden;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  #gameWrapper {
+    position: relative;
+    width: 100%;
+    max-width: calc(100vh * 9 / 16);
+    height: 100%;
+    max-height: calc(100vw * 16 / 9);
+    aspect-ratio: 9 / 16;
+    background: #1a1a1a;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+  }
+</style>
+</head>
+<body>
+<div id="gameWrapper">
+  <canvas id="gameCanvas" width="400" height="700"></canvas>
+</div>
+<script>
+/* ============================================================
+   CONFIG & PALETTE
+   ============================================================ */
+const CANVAS_WIDTH = 400;
+const CANVAS_HEIGHT = 700;
+
+const COLORS = {
+  road: '#2b2b2b',
+  laneMarker: '#ffffff',
+  hudText: '#ffffff',
+  title: '#00e5ff',
+  iceCar: '#00e5ff',
+  fireCar: '#ff3d00',
+  gameOver: '#ff3d00',
+  newRecord: '#ffd700'
+};
+
+const AUDIO_PATHS = {
+  start: 'assets/start.mp3',
+  score: 'assets/score.mp3',
+  crash: 'assets/crash.mp3'
+};
+
+/* ============================================================
+   AudioController
+   Wraps placeholder sound assets. Every play() is defended by
+   try/catch AND a promise .catch() so a missing file or a
+   blocked autoplay policy can never break the game loop.
+   ============================================================ */
+class AudioController {
+  constructor() {
+    this.startSound = new Audio(AUDIO_PATHS.start);
+    this.scoreSound = new Audio(AUDIO_PATHS.score);
+    this.crashSound = new Audio(AUDIO_PATHS.crash);
+  }
+
+  _safePlay(audioNode) {
+    try {
+      const promise = audioNode.play();
+      if (promise && typeof promise.catch === 'function') {
+        promise.catch(() => {
+          // Swallow: missing asset, user-gesture requirement, etc.
+        });
+      }
+    } catch (err) {
+      // Swallow for environments where HTMLAudioElement.play()
+      // throws synchronously (old browsers, WebView quirks).
+    }
+  }
+
+  playStart() {
+    this.startSound.currentTime = 0;
+    this._safePlay(this.startSound);
+  }
+
+  playScore() {
+    this.scoreSound.currentTime = 0;
+    this._safePlay(this.scoreSound);
+  }
+
+  playCrash() {
+    this.crashSound.currentTime = 0;
+    this._safePlay(this.crashSound);
+  }
+}
+
+/* Global audio instance for upcoming stages */
+const audio = new AudioController();
+
+/* ============================================================
+   STAGE 2: INPUT HANDLING & GAME STATE
+   ============================================================ */
+
+const canvas = document.getElementById('gameCanvas');
+
+/* ---------- Road / Player geometry ---------- */
+const ROAD_LEFT = 50;
+const ROAD_RIGHT = CANVAS_WIDTH - 50;
+const PLAYER_Y = CANVAS_HEIGHT - 100;
+const PLAYER_WIDTH = 40;
+const PLAYER_HEIGHT = 60;
+const PLAYER_SPEED = 300; // px per second
+
+/* ---------- State machine ---------- */
+const STATE = { MENU: 0, PLAYING: 1, GAMEOVER: 2 };
+let gameState = STATE.MENU;
+
+let player = {
+  x: CANVAS_WIDTH / 2 - PLAYER_WIDTH / 2,
+  y: PLAYER_Y,
+  w: PLAYER_WIDTH,
+  h: PLAYER_HEIGHT
+};
+
+let enemies = [];
+let score = 0;
+let highScore = 0;
+
+/* Load persisted high score; Capacitor WebViews may block
+   localStorage, so the entire call is wrapped in try/catch. */
+try {
+  const saved = localStorage.getItem('pixelRacerHighScore');
+  if (saved !== null) {
+    highScore = parseInt(saved, 10) || 0;
+  }
+} catch (e) {
+  highScore = 0;
+}
+
+/* ---------- Input: Keyboard ---------- */
+const keys = new Set();
+
+window.addEventListener('keydown', (e) => {
+  const k = e.key.toLowerCase();
+  if (k === 'arrowleft' || k === 'arrowright' || k === 'a' || k === 'd') {
+    keys.add(k);
+  }
+});
+
+window.addEventListener('keyup', (e) => {
+  const k = e.key.toLowerCase();
+  keys.delete(k);
+});
+
+/* ---------- Input: Touch (split-screen) ----------
+   The canvas is conceptually split into a left half (-1)
+   and right half (+1). We track every active touch by its
+   identifier so that if the user drags a finger across the
+   vertical midline, the stored side flips and the car
+   changes direction immediately. */
+
+// Map<touchId, side>  side: -1 = left, +1 = right
+const activeTouches = new Map();
+
+function getCanvasMidX() {
+  const rect = canvas.getBoundingClientRect();
+  return rect.left + rect.width / 2;
+}
+
+function updateTouchSide(identifier, clientX) {
+  const midX = getCanvasMidX();
+  const side = clientX < midX ? -1 : 1;
+  activeTouches.set(identifier, side);
+}
+
+canvas.addEventListener('touchstart', (e) => {
+  e.preventDefault();
+  // Tap-to-start / tap-to-retry for MENU and GAMEOVER
+  if (gameState !== STATE.PLAYING) {
+    startGame();
+    activeTouches.clear();
+    return;
+  }
+  for (let i = 0; i < e.changedTouches.length; i++) {
+    const t = e.changedTouches[i];
+    updateTouchSide(t.identifier, t.clientX);
+  }
+}, { passive: false });
+
+canvas.addEventListener('touchmove', (e) => {
+  e.preventDefault();
+  for (let i = 0; i < e.changedTouches.length; i++) {
+    const t = e.changedTouches[i];
+    if (activeTouches.has(t.identifier)) {
+      updateTouchSide(t.identifier, t.clientX);
+    }
+  }
+}, { passive: false });
+
+canvas.addEventListener('touchend', (e) => {
+  e.preventDefault();
+  for (let i = 0; i < e.changedTouches.length; i++) {
+    activeTouches.delete(e.changedTouches[i].identifier);
+  }
+});
+
+canvas.addEventListener('touchcancel', (e) => {
+  for (let i = 0; i < e.changedTouches.length; i++) {
+    activeTouches.delete(e.changedTouches[i].identifier);
+  }
+});
+
+/* ---------- Unified input direction ----------
+   Keyboard and touch contributions are summed, then clamped
+   to [-1, 0, 1] so opposing left/right inputs cancel out. */
+function getInputDirection() {
+  let dir = 0;
+
+  if (keys.has('arrowleft') || keys.has('a')) dir -= 1;
+  if (keys.has('arrowright') || keys.has('d')) dir += 1;
+
+  for (const side of activeTouches.values()) {
+    dir += side;
+  }
+
+  if (dir < 0) return -1;
+  if (dir > 0) return 1;
+  return 0;
+}
+
+/* ---------- Desktop click-to-start ---------- */
+canvas.addEventListener('mousedown', () => {
+  if (gameState !== STATE.PLAYING) startGame();
+});
+
+/* ---------- Game flow helpers ---------- */
+function resetGame() {
+  player.x = CANVAS_WIDTH / 2 - PLAYER_WIDTH / 2;
+  enemies = [];
+  score = 0;
+}
+
+function startGame() {
+  resetGame();
+  gameState = STATE.PLAYING;
+  audio.playStart();
+}
+
+function triggerGameOver() {
+  gameState = STATE.GAMEOVER;
+  audio.playCrash();
+  if (score > highScore) {
+    highScore = score;
+    try {
+      localStorage.setItem('pixelRacerHighScore', highScore.toString());
+    } catch (e) {
+      /* Ignore storage errors in restricted WebViews */
+    }
+  }
+}
+
+/* ============================================================
+   STAGE 3: RENDERING
+   ============================================================ */
+
+const ctx = canvas.getContext('2d');
+
+/* Vertical offset (pixels) for scrolling lane dashes.
+   Stage 4 will advance this each frame. */
+let laneOffset = 0;
+
+/* ---------- drawRoad() ----------
+   Fills the road surface and draws scrolling dashed lane
+   dividers plus static white shoulder lines. */
+function drawRoad() {
+  // Road surface
+  ctx.fillStyle = COLORS.road;
+  ctx.fillRect(ROAD_LEFT, 0, ROAD_RIGHT - ROAD_LEFT, CANVAS_HEIGHT);
+
+  // White shoulder lines
+  ctx.fillStyle = COLORS.laneMarker;
+  ctx.fillRect(ROAD_LEFT - 4, 0, 4, CANVAS_HEIGHT);
+  ctx.fillRect(ROAD_RIGHT, 0, 4, CANVAS_HEIGHT);
+
+  // Dashed lane dividers (3 lanes => 2 interior lines)
+  const laneCount = 3;
+  const laneWidth = (ROAD_RIGHT - ROAD_LEFT) / laneCount; // 100 px each
+  const dashHeight = 40;
+  const gapHeight = 40;
+
+  ctx.fillStyle = COLORS.laneMarker;
+  for (let i = 1; i < laneCount; i++) {
+    const cx = ROAD_LEFT + i * laneWidth;
+    // Draw enough segments to cover the canvas plus one extra
+    // for seamless wrapping as laneOffset scrolls downward.
+    for (let y = -dashHeight; y < CANVAS_HEIGHT + dashHeight; y += (dashHeight + gapHeight)) {
+      const drawY = y + laneOffset;
+      if (drawY + dashHeight > 0 && drawY < CANVAS_HEIGHT) {
+        ctx.fillRect(cx - 2, drawY, 4, dashHeight);
+      }
+    }
+  }
+}
+
+/* ---------- drawCar() ----------
+   Pure canvas rects/paths—no external images.
+   Player is blue (ice), enemies are red (fire). */
+function drawCar(obj, color) {
+  const x = obj.x;
+  const y = obj.y;
+  const w = obj.w;
+  const h = obj.h;
+
+  // Main chassis
+  ctx.fillStyle = color;
+  ctx.fillRect(x + 4, y, w - 8, h);
+
+  // Cabin / roof
+  ctx.fillRect(x + 8, y + 10, w - 16, h - 24);
+
+  // Windshield
+  ctx.fillStyle = '#111';
+  ctx.fillRect(x + 10, y + 14, w - 20, 6);
+
+  // Wheels (black blocks)
+  ctx.fillStyle = '#000';
+  ctx.fillRect(x, y + 8, 4, 10);
+  ctx.fillRect(x + w - 4, y + 8, 4, 10);
+  ctx.fillRect(x, y + h - 18, 4, 10);
+  ctx.fillRect(x + w - 4, y + h - 18, 4, 10);
+
+  // Lights (yellow)
+  ctx.fillStyle = '#ffeb3b';
+  ctx.fillRect(x + 6, y + 2, 6, 4);
+  ctx.fillRect(x + w - 12, y + 2, 6, 4);
+}
+
+/* ---------- drawHUD() ----------
+   Always-visible score and high-score text. */
+function drawHUD() {
+  ctx.textBaseline = 'top';
+  ctx.font = 'bold 16px monospace';
+  ctx.fillStyle = COLORS.hudText;
+
+  ctx.textAlign = 'left';
+  ctx.fillText('SCORE: ' + score, 10, 8);
+
+  ctx.textAlign = 'right';
+  ctx.fillText('BEST: ' + highScore, CANVAS_WIDTH - 10, 8);
+}
+
+/* ---------- drawMenu() ----------
+   Full-screen overlay shown in STATE.MENU. */
+function drawMenu() {
+  // Darken the play area
+  ctx.fillStyle = '#000';
+  ctx.globalAlpha = 0.65;
+  ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+  ctx.globalAlpha = 1.0;
+
+  // Title
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = COLORS.title;
+  ctx.font = 'bold 44px monospace';
+  ctx.fillText('PIXEL RACER', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 - 40);
+
+  // Prompt
+  ctx.fillStyle = COLORS.hudText;
+  ctx.font = '20px monospace';
+  ctx.fillText('TAP TO START', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 + 20);
+}
+
+/* ---------- drawGameOver() ----------
+   Full-screen overlay shown in STATE.GAMEOVER. */
+function drawGameOver() {
+  // Darken the play area
+  ctx.fillStyle = '#000';
+  ctx.globalAlpha = 0.65;
+  ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+  ctx.globalAlpha = 1.0;
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  // Main text
+  ctx.fillStyle = COLORS.gameOver;
+  ctx.font = 'bold 48px monospace';
+  ctx.fillText('GAME OVER', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 - 60);
+
+  // New record flair
+  if (score >= highScore && score > 0) {
+    ctx.fillStyle = COLORS.newRecord;
+    ctx.font = 'bold 24px monospace';
+    ctx.fillText('NEW RECORD!', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 - 15);
+  }
+
+  // Score summary
+  ctx.fillStyle = COLORS.hudText;
+  ctx.font = '24px monospace';
+  ctx.fillText('SCORE: ' + score, CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 + 25);
+
+  // Restart prompt
+  ctx.font = '20px monospace';
+  ctx.fillText('TAP TO RETRY', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 + 60);
+}
+
+/* ============================================================
+   STAGE 4: GAME LOOP, SPAWNING, COLLISION & SCORING
+   ============================================================ */
+
+const BASE_ENEMY_SPEED = 180; // px/s downward
+const SPEED_PER_SCORE = 10;   // additional px/s per point
+const MAX_GAME_SPEED = 480;   // absolute speed cap
+const SPAWN_INTERVAL = 1.1;   // seconds between enemy spawns
+const ENEMY_WIDTH = 40;
+const ENEMY_HEIGHT = 60;
+
+let lastTime = 0;
+let spawnTimer = 0;
+
+/* ---------- AABB collision with shrink ----------
+   Two rectangles overlap ONLY if they overlap on BOTH axes.
+   We shrink each hitbox by 4 px on every side so a near-miss
+   (paintwork grazing) does not unfairly register as a crash. */
+function rectsOverlap(rectA, rectB) {
+  const shrink = 4;
+
+  const aLeft   = rectA.x + shrink;
+  const aRight  = rectA.x + rectA.w - shrink;
+  const aTop    = rectA.y + shrink;
+  const aBottom = rectA.y + rectA.h - shrink;
+
+  const bLeft   = rectB.x + shrink;
+  const bRight  = rectB.x + rectB.w - shrink;
+  const bTop    = rectB.y + shrink;
+  const bBottom = rectB.y + rectB.h - shrink;
+
+  // Overlap on X axis means A's left edge is left of B's right
+  // AND A's right edge is right of B's left.
+  const overlapX = aLeft < bRight && aRight > bLeft;
+
+  // Overlap on Y axis means A's top is above B's bottom
+  // AND A's bottom is below B's top.
+  const overlapY = aTop < bBottom && aBottom > bTop;
+
+  // Both axes must overlap for the rectangles to intersect.
+  return overlapX && overlapY;
+}
+
+/* ---------- Enemy factory ----------
+   Randomly picks one of the three lanes and places the car
+   centered in that lane so traffic paths are predictable. */
+function spawnEnemy() {
+  const laneCount = 3;
+  const laneWidth = (ROAD_RIGHT - ROAD_LEFT) / laneCount; // 100 px
+  const lane = Math.floor(Math.random() * laneCount);
+  const x = ROAD_LEFT + lane * laneWidth + Math.floor((laneWidth - ENEMY_WIDTH) / 2);
+  enemies.push({
+    x: x,
+    y: -ENEMY_HEIGHT,
+    w: ENEMY_WIDTH,
+    h: ENEMY_HEIGHT,
+    scored: false
+  });
+}
+
+/* ---------- Main game loop ----------
+   requestAnimationFrame delivers a high-resolution timestamp.
+   We derive delta-time in seconds. If the user backgrounded
+   the tab, RAF pauses; on return the gap can be huge. We
+   clamp dt to 0.05 s so enemies cannot teleport through the
+   player in a single catch-up frame. */
+function gameLoop(timestamp) {
+  if (lastTime === 0) lastTime = timestamp;
+  let dt = (timestamp - lastTime) / 1000;
+  if (dt > 0.05) dt = 0.05; // hard clamp
+  lastTime = timestamp;
+
+  /* ---- UPDATE (active only during gameplay) ---- */
+  if (gameState === STATE.PLAYING) {
+    /* 1. Read unified input and move the player horizontally */
+    const dir = getInputDirection();
+    player.x += dir * PLAYER_SPEED * dt;
+
+    /* 2. Clamp player inside the road shoulders */
+    if (player.x < ROAD_LEFT) player.x = ROAD_LEFT;
+    const maxPlayerX = ROAD_RIGHT - player.w;
+    if (player.x > maxPlayerX) player.x = maxPlayerX;
+
+    /* 3. World scroll speed ramps with score then caps */
+    let scrollSpeed = BASE_ENEMY_SPEED + score * SPEED_PER_SCORE;
+    if (scrollSpeed > MAX_GAME_SPEED) scrollSpeed = MAX_GAME_SPEED;
+
+    // Keep lane dashes scrolling at the same rate as traffic
+    laneOffset += scrollSpeed * dt;
+    const dashCycle = 80; // dashHeight(40) + gapHeight(40)
+    laneOffset = laneOffset % dashCycle;
+
+    /* 4. Timer-driven enemy spawning */
+    spawnTimer += dt;
+    if (spawnTimer >= SPAWN_INTERVAL) {
+      spawnTimer -= SPAWN_INTERVAL;
+      spawnEnemy();
+    }
+
+    /* 5. Iterate backwards so removals are safe */
+    for (let i = enemies.length - 1; i >= 0; i--) {
+      const e = enemies[i];
+      e.y += scrollSpeed * dt;
+
+      /* 6. Score event: +1 each time an enemy's bottom edge
+         passes the player's top edge. The 'scored' flag
+         guarantees the point is awarded exactly once. */
+      if (!e.scored && (e.y + e.h > player.y)) {
+        e.scored = true;
+        score += 1;
+        audio.playScore();
+      }
+
+      /* 7. Collision detection using shrunk AABB */
+      if (rectsOverlap(player, e)) {
+        triggerGameOver();
+      }
+
+      /* 8. Cull enemies that have driven off screen */
+      if (e.y > CANVAS_HEIGHT) {
+        enemies.splice(i, 1);
+      }
+    }
+  }
+
+  /* ---- RENDER ---- */
+  ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+
+  drawRoad();
+
+  if (gameState !== STATE.MENU) {
+    drawCar(player, COLORS.iceCar);
+    for (const e of enemies) {
+      drawCar(e, COLORS.fireCar);
+    }
+    drawHUD();
+  }
+
+  if (gameState === STATE.MENU) {
+    drawMenu();
+  } else if (gameState === STATE.GAMEOVER) {
+    drawGameOver();
+  }
+
+  requestAnimationFrame(gameLoop);
+}
+
+/* Boot the engine */
+requestAnimationFrame(gameLoop);</script>
+</body>
+</html>
